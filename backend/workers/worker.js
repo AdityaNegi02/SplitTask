@@ -1,5 +1,5 @@
 const EventEmitter = require('events');
-
+const taskRepo = require('../services/taskRepository');
 class Worker extends EventEmitter {
   constructor(id) {
     super();
@@ -12,56 +12,90 @@ class Worker extends EventEmitter {
 
   // Simulate task processing
   async processTask(task) {
-    this.isProcessing = true;
-    this.currentTask = task;
-
-    console.log(`[Worker ${this.id}] 🔄 Started processing Task #${task.id}: "${task.title}"`);
-
-    try {
-      // Update task status to processing
-      task.status = 'processing';
-      task.startedAt = new Date().toISOString();
-      task.workerId = this.id;
-
-      this.emit('taskStarted', { workerId: this.id, task });
-
-      // Simulate work based on priority
-      const processingTime = this.getProcessingTime(task);
-      
-      // Simulate progress updates
-      await this.simulateProcessing(task, processingTime);
-
-      // Mark as completed
-      task.status = 'completed';
-      task.completedAt = new Date().toISOString();
-      task.progress = 100;
-
-      this.tasksCompleted++;
-      console.log(`[Worker ${this.id}] ✅ Completed Task #${task.id} in ${processingTime}ms`);
-
-      this.emit('taskCompleted', { workerId: this.id, task });
-
-      return { success: true, task };
-
-    } catch (error) {
-      // Handle failure
-      task.status = 'failed';
-      task.error = error.message;
-      task.failedAt = new Date().toISOString();
-
-      this.tasksFailed++;
-      console.log(`[Worker ${this.id}] ❌ Failed Task #${task.id}: ${error.message}`);
-
-      this.emit('taskFailed', { workerId: this.id, task, error });
-
-      return { success: false, task, error };
-
-    } finally {
-      this.isProcessing = false;
-      this.currentTask = null;
-    }
+  // SAFETY CHECK - Skip invalid tasks
+  if (!task || task.id === undefined || task.id === null) {
+    console.error(`[Worker ${this.id}] ⚠️  Skipping invalid task (no ID):`, task);
+    this.isProcessing = false;
+    this.currentTask = null;
+    return { success: false, error: 'Invalid task - missing ID' };
   }
 
+  this.isProcessing = true;
+  this.currentTask = task;
+
+  console.log(`[Worker ${this.id}] 🔄 Started processing Task #${task.id}: "${task.title}"`);
+  try {
+    // Update task status to processing IN DATABASE
+    task.status = 'processing';
+    task.startedAt = new Date().toISOString();
+    task.workerId = this.id;
+    task.progress = 0;
+
+    await taskRepo.update(task.id, {
+      status: 'processing',
+      startedAt: new Date(),
+      workerId: this.id,
+      progress: 0
+    });
+
+    await taskRepo.logHistory(task.id, 'started', this.id, { task });
+
+    this.emit('taskStarted', { workerId: this.id, task });
+
+    // Simulate work
+    const processingTime = this.getProcessingTime(task);
+    await this.simulateProcessing(task, processingTime);
+
+    // Mark as completed IN DATABASE
+    task.status = 'completed';
+    task.completedAt = new Date().toISOString();
+    task.progress = 100;
+
+    await taskRepo.update(task.id, {
+      status: 'completed',
+      completedAt: new Date(),
+      progress: 100
+    });
+
+    await taskRepo.logHistory(task.id, 'completed', this.id, { 
+      processingTime 
+    });
+
+    this.tasksCompleted++;
+    console.log(`[Worker ${this.id}] ✅ Completed Task #${task.id} in ${processingTime}ms`);
+
+    this.emit('taskCompleted', { workerId: this.id, task });
+
+    return { success: true, task };
+
+  } catch (error) {
+    // Handle failure IN DATABASE
+    task.status = 'failed';
+    task.error = error.message;
+    task.failedAt = new Date().toISOString();
+
+    await taskRepo.update(task.id, {
+      status: 'failed',
+      errorMessage: error.message,
+      failedAt: new Date()
+    });
+
+    await taskRepo.logHistory(task.id, 'failed', this.id, { 
+      error: error.message 
+    });
+
+    this.tasksFailed++;
+    console.log(`[Worker ${this.id}] ❌ Failed Task #${task.id}: ${error.message}`);
+
+    this.emit('taskFailed', { workerId: this.id, task, error });
+
+    return { success: false, task, error };
+
+  } finally {
+    this.isProcessing = false;
+    this.currentTask = null;
+  }
+}
   // Get processing time based on priority
   getProcessingTime(task) {
     const baseTimes = {
@@ -74,27 +108,31 @@ class Worker extends EventEmitter {
 
   // Simulate processing with progress updates
   async simulateProcessing(task, totalTime) {
-    const steps = 10;
-    const stepTime = totalTime / steps;
+  const steps = 10;
+  const stepTime = totalTime / steps;
 
-    for (let i = 1; i <= steps; i++) {
-      await this.sleep(stepTime);
-      
-      task.progress = Math.floor((i / steps) * 100);
-      
-      // Emit progress event
-      this.emit('taskProgress', { 
-        workerId: this.id, 
-        taskId: task.id, 
-        progress: task.progress 
-      });
+  for (let i = 1; i <= steps; i++) {
+    await this.sleep(stepTime);
+    
+    task.progress = Math.floor((i / steps) * 100);
+    
+    // Update progress in database every 20%
+    if (task.progress % 20 === 0) {
+      await taskRepo.update(task.id, { progress: task.progress });
+    }
+    
+    this.emit('taskProgress', { 
+      workerId: this.id, 
+      taskId: task.id, 
+      progress: task.progress 
+    });
 
-      // Simulate random failures (5% chance)
-      if (Math.random() < 0.05 && !task.retryCount) {
-        throw new Error('Random processing error');
-      }
+    // Simulate random failures (5% chance)
+    if (Math.random() < 0.05 && !task.retryCount) {
+      throw new Error('Random processing error');
     }
   }
+}
 
   // Sleep utility
   sleep(ms) {

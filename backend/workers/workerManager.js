@@ -1,12 +1,13 @@
 const Worker = require('./worker');
-const taskQueue = require('../services/taskQueue');
+const redisQueue = require('../services/redisQueue');
+const taskRepo = require('../services/taskRepository');
 
 class WorkerManager {
   constructor(workerCount = 3) {
     this.workers = [];
     this.workerCount = workerCount;
     this.isRunning = false;
-    this.queue = taskQueue.getInstance();
+    this.queue = redisQueue.getInstance();
   }
 
   // Initialize workers
@@ -21,15 +22,15 @@ class WorkerManager {
         console.log(`[Worker ${data.workerId}] Task #${data.task.id} started`);
       });
 
-      worker.on('taskCompleted', (data) => {
-        this.queue.complete(data.task.id);
-        this.assignNextTask(worker);
-      });
+      worker.on('taskCompleted', async (data) => {
+  await this.queue.complete(data.task.id);
+  await this.assignNextTask(worker);
+});
 
-      worker.on('taskFailed', (data) => {
-        this.handleTaskFailure(data.task, data.error);
-        this.assignNextTask(worker);
-      });
+worker.on('taskFailed', async (data) => {
+  await this.handleTaskFailure(data.task, data.error);
+  await this.assignNextTask(worker);
+});
 
       worker.on('taskProgress', (data) => {
         // Can emit to dashboard via WebSocket later
@@ -52,9 +53,9 @@ class WorkerManager {
     console.log('🟢 Worker pool started');
 
     // Assign initial tasks to all workers
-    this.workers.forEach(worker => {
-      this.assignNextTask(worker);
-    });
+    this.workers.forEach(async (worker) => {
+  await this.assignNextTask(worker);
+});
 
     // Check for new tasks every 2 seconds
     this.pollInterval = setInterval(() => {
@@ -72,52 +73,81 @@ class WorkerManager {
   }
 
   // Assign next task to available worker
-  assignNextTask(worker) {
-    if (!this.isRunning || worker.isProcessing) {
-      return;
-    }
+  // Assign next task to available worker
+async assignNextTask(worker) {
+  if (!this.isRunning || worker.isProcessing) {
+    return;
+  }
 
-    const task = this.queue.dequeue();
+  const task = await this.queue.dequeue();
+  
+  if (task) {
+    console.log(`[Worker ${worker.id}] 📋 Assigned Task #${task.id}`);
     
-    if (task) {
-      console.log(`[Worker ${worker.id}] 📋 Assigned Task #${task.id}`);
-      worker.processTask(task);
+    // Process task and handle result
+    const result = await worker.processTask(task);
+    
+    // If task was invalid/skipped, remove from queue
+    if (!result.success && result.error?.includes('Invalid task')) {
+      await this.queue.complete(task.id || 'invalid');
+      console.log(`🗑️  Removed invalid task from queue`);
     }
   }
+}
 
   // Check if any workers are idle and assign tasks
-  checkForTasks() {
-    const idleWorkers = this.workers.filter(w => !w.isProcessing);
-    
-    idleWorkers.forEach(worker => {
-      this.assignNextTask(worker);
-    });
+  async checkForTasks() {
+  const idleWorkers = this.workers.filter(w => !w.isProcessing);
+  
+  for (const worker of idleWorkers) {
+    await this.assignNextTask(worker);
   }
+}
 
   // Handle task failure with retry logic
-  handleTaskFailure(task, error) {
-    const maxRetries = 3;
-    task.retryCount = (task.retryCount || 0) + 1;
+  async handleTaskFailure(task, error) {
+  const maxRetries = 3;
+  task.retryCount = (task.retryCount || 0) + 1;
 
-    if (task.retryCount < maxRetries) {
-      console.log(`🔄 Retrying Task #${task.id} (Attempt ${task.retryCount + 1}/${maxRetries})`);
+  // Update retry count in database
+  await taskRepo.update(task.id, {
+    retryCount: task.retryCount,
+    errorMessage: error.message
+  });
+
+  if (task.retryCount < maxRetries) {
+    console.log(`🔄 Retrying Task #${task.id} (Attempt ${task.retryCount + 1}/${maxRetries})`);
+    
+    await taskRepo.logHistory(task.id, 'retried', null, {
+      attempt: task.retryCount + 1,
+      error: error.message
+    });
+    
+    // Exponential backoff
+    const delay = Math.pow(2, task.retryCount) * 1000;
+    
+    setTimeout(async () => {
+      task.status = 'pending';
+      task.error = null;
       
-      // Exponential backoff: 2s, 4s, 8s
-      const delay = Math.pow(2, task.retryCount) * 1000;
-      
-      setTimeout(() => {
-        task.status = 'pending';
-        task.error = null;
-        this.queue.enqueue(task);
-      }, delay);
-    } else {
-      console.log(`❌ Task #${task.id} failed after ${maxRetries} attempts`);
-      this.queue.fail(task.id);
-      task.status = 'failed';
-      task.finalError = error.message;
-    }
+      await taskRepo.update(task.id, { status: 'pending' });
+      await this.queue.requeue(task);
+    }, delay);
+  } else {
+    console.log(`❌ Task #${task.id} failed after ${maxRetries} attempts`);
+    
+    await this.queue.fail(task.id);
+    await taskRepo.update(task.id, { 
+      status: 'failed',
+      errorMessage: `Failed after ${maxRetries} attempts: ${error.message}`
+    });
+    
+    await taskRepo.logHistory(task.id, 'failed_permanently', null, {
+      error: error.message,
+      attempts: maxRetries
+    });
   }
-
+}
   // Get all workers status
   getWorkersStatus() {
     return this.workers.map(w => w.getStatus());
