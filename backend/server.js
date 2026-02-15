@@ -1,16 +1,74 @@
 require('dotenv').config();
 const express = require('express');
+const http = require('http'); 
+const { Server } = require('socket.io'); 
 const cors = require('cors');
 const redisQueue = require('./services/redisQueue');
 const taskRepo = require('./services/taskRepository');
-const WorkerManager = require('./workers/WorkerManager');
+const WorkerManager = require('./workers/workerManager');
 
 const app = express();
+const server = http.createServer(app);  // ← ADD THIS
+const io = new Server(server, {  // ← ADD THIS
+  cors: {
+    origin: "http://localhost:3000",  // React app URL
+    methods: ["GET", "POST"]
+  }
+});
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 
+// Middleware
+app.use(cors());
+app.use(express.json());
+
+// WebSocket connection
+io.on('connection', (socket) => {
+  console.log('🔌 Dashboard connected:', socket.id);
+
+  // Send initial stats
+  socket.emit('stats', getSystemStats());
+
+  socket.on('disconnect', () => {
+    console.log('🔌 Dashboard disconnected:', socket.id);
+  });
+});
+
+// Helper function to get system stats
+async function getSystemStats() {
+  try {
+    const workerStats = workerManager.getStats();
+    const queueStats = await queue.getStats();
+    const dbStats = await taskRepo.getStats();
+
+    return {
+      queue: queueStats,
+      workers: workerStats.workers,
+      isRunning: workerStats.isRunning,
+      database: {
+        totalTasks: parseInt(dbStats.total_tasks) || 0,
+        pending: parseInt(dbStats.pending) || 0,
+        processing: parseInt(dbStats.processing) || 0,
+        completed: parseInt(dbStats.completed) || 0,
+        failed: parseInt(dbStats.failed) || 0,
+        avgCompletionTime: parseFloat(dbStats.avg_completion_time_seconds) || 0
+      }
+    };
+  } catch (error) {
+    console.error('Error getting stats:', error);
+    return null;
+  }
+}
+
+// Broadcast stats every 2 seconds
+setInterval(async () => {
+  const stats = await getSystemStats();
+  if (stats) {
+    io.emit('stats', stats);
+  }
+}, 2000);
 // Initialize Redis queue and workers
 const queue = redisQueue.getInstance();
 const workerManager = new WorkerManager(3); // 3 workers
@@ -24,16 +82,24 @@ let taskIdCounter = 1;
 // Initialize task counter from database
 async function initializeTaskCounter() {
   try {
-    const result = await taskRepo.query('SELECT MAX(id) as max_id FROM tasks');
-    const maxId = result.rows[0]?.max_id;
-    taskIdCounter = maxId ? maxId + 1 : 1;
-    console.log(`📊 Task ID counter initialized: Starting from ${taskIdCounter}`);
+    // Get the NEXT value from PostgreSQL sequence
+    const result = await taskRepo.query("SELECT nextval('tasks_id_seq') as next_id");
+    taskIdCounter = parseInt(result.rows[0].next_id);
+    
+    console.log(`📊 Task ID counter synchronized with database: ${taskIdCounter}`);
   } catch (error) {
-    console.error('⚠️  Could not initialize task counter:', error.message);
-    taskIdCounter = 1;
+    console.error('⚠️  Could not sync task counter:', error.message);
+    
+    // Fallback: use MAX(id) + 1
+    try {
+      const maxResult = await taskRepo.query('SELECT COALESCE(MAX(id), 0) as max_id FROM tasks');
+      taskIdCounter = maxResult.rows[0].max_id + 1;
+      console.log(`📊 Task ID counter fallback: ${taskIdCounter}`);
+    } catch (err) {
+      taskIdCounter = 1;
+    }
   }
 }
-
 // Health check
 app.get('/health', (req, res) => {
   res.json({ 
@@ -69,7 +135,7 @@ app.get('/api/tasks', async (req, res) => {
   }
 });
 
-// Create a new task
+// Create new task
 app.post('/api/tasks', async (req, res) => {
   try {
     const { title, description, priority } = req.body;
@@ -81,8 +147,8 @@ app.post('/api/tasks', async (req, res) => {
       });
     }
 
+    // Don't manually set ID - let PostgreSQL generate it
     const newTask = {
-      id: taskIdCounter++,
       title,
       description: description || '',
       priority: priority || 'medium',
@@ -94,8 +160,11 @@ app.post('/api/tasks', async (req, res) => {
       retryCount: 0
     };
 
-    // Save to PostgreSQL
-    await taskRepo.create(newTask);
+    // Save to PostgreSQL (it will auto-generate the ID)
+    const createdTask = await taskRepo.create(newTask);
+    
+    // Add the ID from database to the task
+    newTask.id = createdTask.id;
     
     // Add to Redis queue for processing
     await queue.enqueue(newTask);
@@ -103,7 +172,7 @@ app.post('/api/tasks', async (req, res) => {
     res.status(201).json({
       success: true,
       message: 'Task created and queued for processing',
-      task: newTask
+      task: createdTask
     });
   } catch (error) {
     console.error('Error creating task:', error);
@@ -113,7 +182,6 @@ app.post('/api/tasks', async (req, res) => {
     });
   }
 });
-
 // Get single task by ID (from database)
 app.get('/api/tasks/:id', async (req, res) => {
   try {
@@ -275,6 +343,8 @@ process.on('SIGTERM', async () => {
   console.log('🛑 SIGTERM received, shutting down gracefully...');
   workerManager.stop();
   await queue.close();
+   io.close();  // ← ADD THIS
+  server.close();  // ← ADD THIS
   process.exit(0);
 });
 
@@ -282,6 +352,8 @@ process.on('SIGINT', async () => {
   console.log('🛑 SIGINT received, shutting down gracefully...');
   workerManager.stop();
   await queue.close();
+  io.close();  // ← ADD THIS
+  server.close();  // ← ADD THIS
   process.exit(0);
 });
 
@@ -293,7 +365,7 @@ async function startServer() {
   // Initialize task counter from database first
   await initializeTaskCounter();
   
-  app.listen(PORT, () => {
+  server.listen(PORT, () => {
     console.log('');
     console.log('═══════════════════════════════════════════════');
     console.log('🚀 SplitTask - Distributed Task Scheduler');

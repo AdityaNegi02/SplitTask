@@ -128,9 +128,9 @@ class Worker extends EventEmitter {
     });
 
     // Simulate random failures (5% chance)
-    if (Math.random() < 0.05 && !task.retryCount) {
-      throw new Error('Random processing error');
-    }
+    // if (Math.random() < 0.05 && !task.retryCount) {
+    //   throw new Error('Random processing error');
+    // }
   }
 }
 

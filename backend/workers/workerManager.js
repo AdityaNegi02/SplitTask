@@ -23,9 +23,9 @@ class WorkerManager {
       });
 
       worker.on('taskCompleted', async (data) => {
-  await this.queue.complete(data.task.id);
-  await this.assignNextTask(worker);
-});
+      await this.queue.complete(data.task.id);
+      await this.assignNextTask(worker);
+    });
 
 worker.on('taskFailed', async (data) => {
   await this.handleTaskFailure(data.task, data.error);
@@ -88,13 +88,16 @@ async assignNextTask(worker) {
     const result = await worker.processTask(task);
     
     // If task was invalid/skipped, remove from queue
-    if (!result.success && result.error?.includes('Invalid task')) {
-      await this.queue.complete(task.id || 'invalid');
-      console.log(`🗑️  Removed invalid task from queue`);
+    if (!result.success && result.error) {
+      const errorMessage = result.error.message || result.error;
+      
+      if (typeof errorMessage === 'string' && errorMessage.includes('Invalid task')) {
+        await this.queue.complete(task.id || 'invalid');
+        console.log(`🗑️  Removed invalid task from queue`);
+      }
     }
   }
 }
-
   // Check if any workers are idle and assign tasks
   async checkForTasks() {
   const idleWorkers = this.workers.filter(w => !w.isProcessing);

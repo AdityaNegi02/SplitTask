@@ -3,33 +3,32 @@ const db = require('./database');
 class TaskRepository {
   // Create new task in database
   async create(task) {
-    const query = `
-      INSERT INTO tasks (
-        id, title, description, priority, status, progress, 
-        retry_count, created_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-      RETURNING *
-    `;
+  const query = `
+    INSERT INTO tasks (
+      title, description, priority, status, progress, 
+      retry_count, created_at
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+    RETURNING *
+  `;
 
-    const values = [
-      task.id,
-      task.title,
-      task.description || '',
-      task.priority || 'medium',
-      task.status || 'pending',
-      task.progress || 0,
-      task.retryCount || 0,
-      task.createdAt || new Date()
-    ];
+  const values = [
+    task.title,
+    task.description || '',
+    task.priority || 'medium',
+    task.status || 'pending',
+    task.progress || 0,
+    task.retryCount || 0,
+    task.createdAt || new Date()
+  ];
 
-    const result = await db.query(query, values);
-    
-    // Log to history
-    await this.logHistory(task.id, 'created', null, { task });
-    
-    return result.rows[0];
-  }
-
+  const result = await db.query(query, values);
+  
+  // Log to history with the generated ID
+  const createdTask = result.rows[0];
+  await this.logHistory(createdTask.id, 'created', null, { task: createdTask });
+  
+  return createdTask;
+}
   // Update task
   async update(taskId, updates) {
     const fields = [];
