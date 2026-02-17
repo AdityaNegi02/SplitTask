@@ -6,6 +6,8 @@ const cors = require('cors');
 const redisQueue = require('./services/redisQueue');
 const taskRepo = require('./services/taskRepository');
 const WorkerManager = require('./workers/workerManager');
+const aiService = require('./services/aiService');
+
 
 const app = express();
 const server = http.createServer(app);  // ← ADD THIS
@@ -136,6 +138,7 @@ app.get('/api/tasks', async (req, res) => {
 });
 
 // Create new task
+// POST /api/tasks - Create new task with AI analysis
 app.post('/api/tasks', async (req, res) => {
   try {
     const { title, description, priority } = req.body;
@@ -147,8 +150,8 @@ app.post('/api/tasks', async (req, res) => {
       });
     }
 
-    // Don't manually set ID - let PostgreSQL generate it
-    const newTask = {
+    // Create basic task object
+    const taskData = {
       title,
       description: description || '',
       priority: priority || 'medium',
@@ -160,25 +163,65 @@ app.post('/api/tasks', async (req, res) => {
       retryCount: 0
     };
 
-    // Save to PostgreSQL (it will auto-generate the ID)
-    const createdTask = await taskRepo.create(newTask);
+    // 🤖 AI ANALYSIS - THIS IS THE NEW CODE!
+    console.log('\n🤖 ============ AI ANALYSIS START ============');
+    console.log('🤖 Analyzing task with AI...');
+    console.log('📝 Task:', taskData.title);
     
-    // Add the ID from database to the task
-    newTask.id = createdTask.id;
+    const aiAnalysis = await aiService.analyzeTask(taskData);
     
-    // Add to Redis queue for processing
-    await queue.enqueue(newTask);
+    console.log('✅ AI Analysis Complete!');
+    console.log('🤖 Result:', JSON.stringify(aiAnalysis, null, 2));
+    
+    // Check if AI recommends different priority
+    if (aiAnalysis.recommendedPriority !== taskData.priority) {
+      console.log(`\n💡 AI RECOMMENDATION:`);
+      console.log(`   Your choice: ${taskData.priority.toUpperCase()}`);
+      console.log(`   AI suggests: ${aiAnalysis.recommendedPriority.toUpperCase()}`);
+      console.log(`   Reasoning: ${aiAnalysis.reasoning}`);
+    }
+    
+    console.log('🤖 ============ AI ANALYSIS END ============\n');
+    
+    // Store AI analysis with task
+    taskData.aiAnalysis = {
+      complexity: aiAnalysis.complexity,
+      estimatedTime: aiAnalysis.estimatedTime,
+      recommendedPriority: aiAnalysis.recommendedPriority,
+      reasoning: aiAnalysis.reasoning,
+      tags: aiAnalysis.tags,
+      analyzedAt: new Date().toISOString()
+    };
 
+    // Save to PostgreSQL
+    const createdTask = await taskRepo.create(taskData);
+    
+    // Add the ID from database
+    taskData.id = createdTask.id;
+    
+    // Add to Redis queue
+    await queue.enqueue(taskData);
+
+    // Return response with AI insights
     res.status(201).json({
       success: true,
       message: 'Task created and queued for processing',
-      task: createdTask
+      task: createdTask,
+      aiInsights: {
+        complexity: aiAnalysis.complexity,
+        estimatedTime: `${aiAnalysis.estimatedTime} seconds`,
+        aiRecommendedPriority: aiAnalysis.recommendedPriority,
+        originalPriority: taskData.priority,
+        reasoning: aiAnalysis.reasoning,
+        tags: aiAnalysis.tags
+      }
     });
   } catch (error) {
-    console.error('Error creating task:', error);
+    console.error('❌ Error creating task:', error);
     res.status(500).json({
       success: false,
-      error: 'Failed to create task'
+      error: 'Failed to create task',
+      details: error.message
     });
   }
 });
